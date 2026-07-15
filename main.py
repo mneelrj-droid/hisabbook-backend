@@ -1,6 +1,7 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Header, Depends
 from starlette.middleware.cors import CORSMiddleware
-import sqlite3
+import psycopg2
+import psycopg2.extras
 import os
 import uuid
 import jwt
@@ -11,7 +12,8 @@ from typing import List, Optional, Literal
 from datetime import datetime, timezone, timedelta
 
 ROOT_DIR = Path(__file__).parent
-DB_PATH = ROOT_DIR / "hisabbook.db"
+
+DATABASE_URL = os.environ["DATABASE_URL"]  # Supabase Postgres connection string
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "hisabbook-secret-change-me-in-production")
 JWT_ALG = "HS256"
@@ -22,17 +24,39 @@ api_router = APIRouter(prefix="/api")
 
 
 # ---------------- DB setup ----------------
+class DBWrapper:
+    """Thin wrapper so the rest of the code can keep using the
+    conn.execute(query, params).fetchone()/.fetchall() shortcut style,
+    just like the old sqlite3 connection did."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def execute(self, query, params=None):
+        cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(query, params or ())
+        return cur
+
+    def executescript(self, script):
+        cur = self.conn.cursor()
+        cur.execute(script)
+        return cur
+
+    def commit(self):
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
+
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    conn = psycopg2.connect(DATABASE_URL)
+    return DBWrapper(conn)
 
 
 def init_db():
     conn = get_db()
-    c = conn.cursor()
-    c.executescript(
+    conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS users (
             user_id TEXT PRIMARY KEY,
@@ -98,6 +122,7 @@ def init_db():
             date TEXT,
             created_at TEXT
         );
+        ALTER TABLE transactions ADD COLUMN IF NOT EXISTS company_id TEXT;
         """
     )
     conn.commit()
@@ -105,19 +130,6 @@ def init_db():
 
 
 init_db()
-
-
-def migrate_db():
-    conn = get_db()
-    try:
-        conn.execute("ALTER TABLE transactions ADD COLUMN company_id TEXT")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # column already exists
-    conn.close()
-
-
-migrate_db()
 
 
 # ---------------- helpers ----------------
@@ -154,7 +166,7 @@ def current_user(authorization: Optional[str] = Header(None)) -> dict:
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     conn = get_db()
-    row = conn.execute("SELECT * FROM users WHERE user_id=?", (payload["sub"],)).fetchone()
+    row = conn.execute("SELECT * FROM users WHERE user_id=%s", (payload["sub"],)).fetchone()
     conn.close()
     if not row:
         raise HTTPException(status_code=401, detail="User not found")
@@ -195,12 +207,12 @@ def seed_defaults(conn, user_id: str):
     ts = now_utc().isoformat()
     for cat in DEFAULT_CATEGORIES:
         conn.execute(
-            "INSERT INTO categories (id,user_id,name,kind,color,icon,created_at) VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO categories (id,user_id,name,kind,color,icon,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
             (str(uuid.uuid4()), user_id, cat["name"], cat["kind"], cat["color"], cat["icon"], ts),
         )
     for acc in DEFAULT_ACCOUNTS:
         conn.execute(
-            "INSERT INTO accounts (id,user_id,name,type,opening_balance,color,icon,created_at) VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO accounts (id,user_id,name,type,opening_balance,color,icon,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
             (str(uuid.uuid4()), user_id, acc["name"], acc["type"], acc["opening_balance"], acc["color"], acc["icon"], ts),
         )
 
@@ -272,19 +284,19 @@ async def root():
 @api_router.post("/auth/register")
 async def register(payload: RegisterIn):
     conn = get_db()
-    existing = conn.execute("SELECT * FROM users WHERE email=?", (payload.email.lower(),)).fetchone()
+    existing = conn.execute("SELECT * FROM users WHERE email=%s", (payload.email.lower(),)).fetchone()
     if existing:
         conn.close()
         raise HTTPException(status_code=400, detail="Email already registered. Please login instead.")
     user_id = f"user_{uuid.uuid4().hex[:12]}"
     conn.execute(
-        "INSERT INTO users (user_id,email,password_hash,name,language,created_at) VALUES (?,?,?,?,?,?)",
+        "INSERT INTO users (user_id,email,password_hash,name,language,created_at) VALUES (%s,%s,%s,%s,%s,%s)",
         (user_id, payload.email.lower(), hash_password(payload.password),
          payload.name or payload.email.split("@")[0], "en", now_utc().isoformat()),
     )
     seed_defaults(conn, user_id)
     conn.commit()
-    row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+    row = conn.execute("SELECT * FROM users WHERE user_id=%s", (user_id,)).fetchone()
     conn.close()
     token = make_jwt(user_id)
     return {"token": token, "user": user_public(dict(row))}
@@ -293,7 +305,7 @@ async def register(payload: RegisterIn):
 @api_router.post("/auth/login")
 async def login(payload: LoginIn):
     conn = get_db()
-    row = conn.execute("SELECT * FROM users WHERE email=?", (payload.email.lower(),)).fetchone()
+    row = conn.execute("SELECT * FROM users WHERE email=%s", (payload.email.lower(),)).fetchone()
     conn.close()
     if not row or not verify_password(payload.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -309,7 +321,7 @@ async def me(user: dict = Depends(current_user)):
 @api_router.post("/auth/language")
 async def set_language(payload: LanguageIn, user: dict = Depends(current_user)):
     conn = get_db()
-    conn.execute("UPDATE users SET language=? WHERE user_id=?", (payload.language, user["user_id"]))
+    conn.execute("UPDATE users SET language=%s WHERE user_id=%s", (payload.language, user["user_id"]))
     conn.commit()
     conn.close()
     return {"ok": True, "language": payload.language}
@@ -319,16 +331,16 @@ async def set_language(payload: LanguageIn, user: dict = Depends(current_user)):
 @api_router.get("/accounts")
 async def list_accounts(user: dict = Depends(current_user)):
     conn = get_db()
-    rows = conn.execute("SELECT * FROM accounts WHERE user_id=?", (user["user_id"],)).fetchall()
+    rows = conn.execute("SELECT * FROM accounts WHERE user_id=%s", (user["user_id"],)).fetchall()
     items = []
     for r in rows:
         it = dict(r)
         inc = conn.execute(
-            "SELECT COALESCE(SUM(amount),0) t FROM transactions WHERE user_id=? AND account_id=? AND kind='income'",
+            "SELECT COALESCE(SUM(amount),0) t FROM transactions WHERE user_id=%s AND account_id=%s AND kind='income'",
             (user["user_id"], it["id"]),
         ).fetchone()["t"]
         exp = conn.execute(
-            "SELECT COALESCE(SUM(amount),0) t FROM transactions WHERE user_id=? AND account_id=? AND kind='expense'",
+            "SELECT COALESCE(SUM(amount),0) t FROM transactions WHERE user_id=%s AND account_id=%s AND kind='expense'",
             (user["user_id"], it["id"]),
         ).fetchone()["t"]
         it["balance"] = float(it["opening_balance"]) + inc - exp
@@ -342,7 +354,7 @@ async def create_account(payload: AccountIn, user: dict = Depends(current_user))
     conn = get_db()
     doc_id = str(uuid.uuid4())
     conn.execute(
-        "INSERT INTO accounts (id,user_id,name,type,opening_balance,color,icon,created_at) VALUES (?,?,?,?,?,?,?,?)",
+        "INSERT INTO accounts (id,user_id,name,type,opening_balance,color,icon,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
         (doc_id, user["user_id"], payload.name, payload.type, payload.opening_balance,
          payload.color, payload.icon, now_utc().isoformat()),
     )
@@ -354,8 +366,8 @@ async def create_account(payload: AccountIn, user: dict = Depends(current_user))
 @api_router.delete("/accounts/{account_id}")
 async def delete_account(account_id: str, user: dict = Depends(current_user)):
     conn = get_db()
-    conn.execute("DELETE FROM accounts WHERE id=? AND user_id=?", (account_id, user["user_id"]))
-    conn.execute("DELETE FROM transactions WHERE account_id=? AND user_id=?", (account_id, user["user_id"]))
+    conn.execute("DELETE FROM accounts WHERE id=%s AND user_id=%s", (account_id, user["user_id"]))
+    conn.execute("DELETE FROM transactions WHERE account_id=%s AND user_id=%s", (account_id, user["user_id"]))
     conn.commit()
     conn.close()
     return {"ok": True}
@@ -365,7 +377,7 @@ async def delete_account(account_id: str, user: dict = Depends(current_user)):
 @api_router.get("/categories")
 async def list_categories(user: dict = Depends(current_user)):
     conn = get_db()
-    rows = conn.execute("SELECT * FROM categories WHERE user_id=?", (user["user_id"],)).fetchall()
+    rows = conn.execute("SELECT * FROM categories WHERE user_id=%s", (user["user_id"],)).fetchall()
     conn.close()
     return {"categories": [dict(r) for r in rows]}
 
@@ -375,7 +387,7 @@ async def create_category(payload: CategoryIn, user: dict = Depends(current_user
     conn = get_db()
     doc_id = str(uuid.uuid4())
     conn.execute(
-        "INSERT INTO categories (id,user_id,name,kind,color,icon,created_at) VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO categories (id,user_id,name,kind,color,icon,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
         (doc_id, user["user_id"], payload.name, payload.kind, payload.color, payload.icon, now_utc().isoformat()),
     )
     conn.commit()
@@ -386,7 +398,7 @@ async def create_category(payload: CategoryIn, user: dict = Depends(current_user
 @api_router.delete("/categories/{category_id}")
 async def delete_category(category_id: str, user: dict = Depends(current_user)):
     conn = get_db()
-    conn.execute("DELETE FROM categories WHERE id=? AND user_id=?", (category_id, user["user_id"]))
+    conn.execute("DELETE FROM categories WHERE id=%s AND user_id=%s", (category_id, user["user_id"]))
     conn.commit()
     conn.close()
     return {"ok": True}
@@ -396,7 +408,7 @@ async def delete_category(category_id: str, user: dict = Depends(current_user)):
 @api_router.get("/companies")
 async def list_companies(user: dict = Depends(current_user)):
     conn = get_db()
-    rows = conn.execute("SELECT * FROM companies WHERE user_id=?", (user["user_id"],)).fetchall()
+    rows = conn.execute("SELECT * FROM companies WHERE user_id=%s", (user["user_id"],)).fetchall()
     conn.close()
     return {"companies": [dict(r) for r in rows]}
 
@@ -406,7 +418,7 @@ async def create_company(payload: CompanyIn, user: dict = Depends(current_user))
     doc_id = str(uuid.uuid4())
     conn = get_db()
     conn.execute(
-        "INSERT INTO companies (id,user_id,name,created_at) VALUES (?,?,?,?)",
+        "INSERT INTO companies (id,user_id,name,created_at) VALUES (%s,%s,%s,%s)",
         (doc_id, user["user_id"], payload.name, now_utc().isoformat()),
     )
     conn.commit()
@@ -417,7 +429,7 @@ async def create_company(payload: CompanyIn, user: dict = Depends(current_user))
 @api_router.delete("/companies/{company_id}")
 async def delete_company(company_id: str, user: dict = Depends(current_user)):
     conn = get_db()
-    conn.execute("DELETE FROM companies WHERE id=? AND user_id=?", (company_id, user["user_id"]))
+    conn.execute("DELETE FROM companies WHERE id=%s AND user_id=%s", (company_id, user["user_id"]))
     conn.commit()
     conn.close()
     return {"ok": True}
@@ -429,17 +441,17 @@ async def list_transactions(user: dict = Depends(current_user), limit: int = 200
     conn = get_db()
     if company_id:
         rows = conn.execute(
-            "SELECT * FROM transactions WHERE user_id=? AND company_id=? ORDER BY date DESC LIMIT ?",
+            "SELECT * FROM transactions WHERE user_id=%s AND company_id=%s ORDER BY date DESC LIMIT %s",
             (user["user_id"], company_id, limit),
         ).fetchall()
     elif month:
         rows = conn.execute(
-            "SELECT * FROM transactions WHERE user_id=? AND month=? ORDER BY date DESC LIMIT ?",
+            "SELECT * FROM transactions WHERE user_id=%s AND month=%s ORDER BY date DESC LIMIT %s",
             (user["user_id"], month, limit),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM transactions WHERE user_id=? ORDER BY date DESC LIMIT ?",
+            "SELECT * FROM transactions WHERE user_id=%s ORDER BY date DESC LIMIT %s",
             (user["user_id"], limit),
         ).fetchall()
     conn.close()
@@ -458,7 +470,7 @@ async def create_transaction(payload: TransactionIn, user: dict = Depends(curren
     conn = get_db()
     conn.execute(
         "INSERT INTO transactions (id,user_id,kind,amount,account_id,category_id,company_id,note,date,month,created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         (doc_id, user["user_id"], payload.kind, payload.amount, payload.account_id,
          payload.category_id, payload.company_id, payload.note or "", dt.isoformat(), month, now_utc().isoformat()),
     )
@@ -470,7 +482,7 @@ async def create_transaction(payload: TransactionIn, user: dict = Depends(curren
 @api_router.delete("/transactions/{tx_id}")
 async def delete_transaction(tx_id: str, user: dict = Depends(current_user)):
     conn = get_db()
-    conn.execute("DELETE FROM transactions WHERE id=? AND user_id=?", (tx_id, user["user_id"]))
+    conn.execute("DELETE FROM transactions WHERE id=%s AND user_id=%s", (tx_id, user["user_id"]))
     conn.commit()
     conn.close()
     return {"ok": True}
@@ -482,19 +494,19 @@ async def summary(user: dict = Depends(current_user), month: Optional[str] = Non
     month = month or now_utc().strftime("%Y-%m")
     conn = get_db()
     income = conn.execute(
-        "SELECT COALESCE(SUM(amount),0) t FROM transactions WHERE user_id=? AND month=? AND kind='income'",
+        "SELECT COALESCE(SUM(amount),0) t FROM transactions WHERE user_id=%s AND month=%s AND kind='income'",
         (user["user_id"], month),
     ).fetchone()["t"]
     expense = conn.execute(
-        "SELECT COALESCE(SUM(amount),0) t FROM transactions WHERE user_id=? AND month=? AND kind='expense'",
+        "SELECT COALESCE(SUM(amount),0) t FROM transactions WHERE user_id=%s AND month=%s AND kind='expense'",
         (user["user_id"], month),
     ).fetchone()["t"]
 
     cat_rows = conn.execute(
-        "SELECT category_id, SUM(amount) t FROM transactions WHERE user_id=? AND month=? AND kind='expense' GROUP BY category_id",
+        "SELECT category_id, SUM(amount) t FROM transactions WHERE user_id=%s AND month=%s AND kind='expense' GROUP BY category_id",
         (user["user_id"], month),
     ).fetchall()
-    cats = {r["id"]: dict(r) for r in conn.execute("SELECT * FROM categories WHERE user_id=?", (user["user_id"],)).fetchall()}
+    cats = {r["id"]: dict(r) for r in conn.execute("SELECT * FROM categories WHERE user_id=%s", (user["user_id"],)).fetchall()}
     by_category = []
     for r in cat_rows:
         meta = cats.get(r["category_id"], {"name": "Uncategorized", "color": "#4F5753"})
@@ -510,9 +522,9 @@ async def summary(user: dict = Depends(current_user), month: Optional[str] = Non
             year -= 1
         months_list.append(f"{year:04d}-{m:02d}")
     monthly = {mm: {"income": 0.0, "expense": 0.0} for mm in months_list}
-    placeholders = ",".join("?" for _ in months_list)
+    placeholders = ",".join("%s" for _ in months_list)
     m_rows = conn.execute(
-        f"SELECT month, kind, SUM(amount) t FROM transactions WHERE user_id=? AND month IN ({placeholders}) GROUP BY month, kind",
+        f"SELECT month, kind, SUM(amount) t FROM transactions WHERE user_id=%s AND month IN ({placeholders}) GROUP BY month, kind",
         (user["user_id"], *months_list),
     ).fetchall()
     for r in m_rows:
@@ -532,7 +544,7 @@ async def summary(user: dict = Depends(current_user), month: Optional[str] = Non
 @api_router.get("/groups")
 async def list_groups(user: dict = Depends(current_user)):
     conn = get_db()
-    rows = conn.execute("SELECT * FROM groups WHERE user_id=?", (user["user_id"],)).fetchall()
+    rows = conn.execute("SELECT * FROM groups WHERE user_id=%s", (user["user_id"],)).fetchall()
     conn.close()
     out = []
     for r in rows:
@@ -552,7 +564,7 @@ async def create_group(payload: GroupIn, user: dict = Depends(current_user)):
     doc_id = str(uuid.uuid4())
     conn = get_db()
     conn.execute(
-        "INSERT INTO groups (id,user_id,name,members,created_at) VALUES (?,?,?,?,?)",
+        "INSERT INTO groups (id,user_id,name,members,created_at) VALUES (%s,%s,%s,%s,%s)",
         (doc_id, user["user_id"], payload.name, "|".join(members), now_utc().isoformat()),
     )
     conn.commit()
@@ -563,8 +575,8 @@ async def create_group(payload: GroupIn, user: dict = Depends(current_user)):
 @api_router.delete("/groups/{group_id}")
 async def delete_group(group_id: str, user: dict = Depends(current_user)):
     conn = get_db()
-    conn.execute("DELETE FROM groups WHERE id=? AND user_id=?", (group_id, user["user_id"]))
-    conn.execute("DELETE FROM split_expenses WHERE group_id=? AND user_id=?", (group_id, user["user_id"]))
+    conn.execute("DELETE FROM groups WHERE id=%s AND user_id=%s", (group_id, user["user_id"]))
+    conn.execute("DELETE FROM split_expenses WHERE group_id=%s AND user_id=%s", (group_id, user["user_id"]))
     conn.commit()
     conn.close()
     return {"ok": True}
@@ -573,14 +585,14 @@ async def delete_group(group_id: str, user: dict = Depends(current_user)):
 @api_router.get("/groups/{group_id}")
 async def get_group(group_id: str, user: dict = Depends(current_user)):
     conn = get_db()
-    row = conn.execute("SELECT * FROM groups WHERE id=? AND user_id=?", (group_id, user["user_id"])).fetchone()
+    row = conn.execute("SELECT * FROM groups WHERE id=%s AND user_id=%s", (group_id, user["user_id"])).fetchone()
     if not row:
         conn.close()
         raise HTTPException(404, "Not found")
     group = dict(row)
     group["members"] = group["members"].split("|")
     exp_rows = conn.execute(
-        "SELECT * FROM split_expenses WHERE group_id=? AND user_id=? ORDER BY date DESC",
+        "SELECT * FROM split_expenses WHERE group_id=%s AND user_id=%s ORDER BY date DESC",
         (group_id, user["user_id"]),
     ).fetchall()
     conn.close()
@@ -603,7 +615,7 @@ async def get_group(group_id: str, user: dict = Depends(current_user)):
 @api_router.post("/groups/{group_id}/expenses")
 async def add_split(group_id: str, payload: SplitExpenseIn, user: dict = Depends(current_user)):
     conn = get_db()
-    row = conn.execute("SELECT * FROM groups WHERE id=? AND user_id=?", (group_id, user["user_id"])).fetchone()
+    row = conn.execute("SELECT * FROM groups WHERE id=%s AND user_id=%s", (group_id, user["user_id"])).fetchone()
     if not row:
         conn.close()
         raise HTTPException(404, "Group not found")
@@ -618,7 +630,7 @@ async def add_split(group_id: str, payload: SplitExpenseIn, user: dict = Depends
     doc_id = str(uuid.uuid4())
     conn.execute(
         "INSERT INTO split_expenses (id,user_id,group_id,description,amount,paid_by,split_among,date,created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?)",
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         (doc_id, user["user_id"], group_id, payload.description, payload.amount, payload.paid_by,
          "|".join(payload.split_among), payload.date or now_utc().isoformat(), now_utc().isoformat()),
     )
@@ -631,7 +643,7 @@ async def add_split(group_id: str, payload: SplitExpenseIn, user: dict = Depends
 async def delete_split(group_id: str, expense_id: str, user: dict = Depends(current_user)):
     conn = get_db()
     conn.execute(
-        "DELETE FROM split_expenses WHERE id=? AND group_id=? AND user_id=?",
+        "DELETE FROM split_expenses WHERE id=%s AND group_id=%s AND user_id=%s",
         (expense_id, group_id, user["user_id"]),
     )
     conn.commit()
