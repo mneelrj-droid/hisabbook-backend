@@ -479,6 +479,30 @@ async def create_transaction(payload: TransactionIn, user: dict = Depends(curren
     return {"transaction": {"id": doc_id, "date": dt.isoformat(), "month": month, **payload.dict()}}
 
 
+@api_router.put("/transactions/{tx_id}")
+async def update_transaction(tx_id: str, payload: TransactionIn, user: dict = Depends(current_user)):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM transactions WHERE id=%s AND user_id=%s", (tx_id, user["user_id"])).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(404, "Transaction not found")
+    date_str = payload.date or row["date"]
+    try:
+        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    except Exception:
+        dt = datetime.fromisoformat(row["date"])
+    month = dt.strftime("%Y-%m")
+    conn.execute(
+        "UPDATE transactions SET kind=%s, amount=%s, account_id=%s, category_id=%s, company_id=%s, note=%s, date=%s, month=%s "
+        "WHERE id=%s AND user_id=%s",
+        (payload.kind, payload.amount, payload.account_id, payload.category_id, payload.company_id,
+         payload.note or "", dt.isoformat(), month, tx_id, user["user_id"]),
+    )
+    conn.commit()
+    conn.close()
+    return {"transaction": {"id": tx_id, "date": dt.isoformat(), "month": month, **payload.dict()}}
+
+
 @api_router.delete("/transactions/{tx_id}")
 async def delete_transaction(tx_id: str, user: dict = Depends(current_user)):
     conn = get_db()
