@@ -3,6 +3,7 @@ from starlette.middleware.cors import CORSMiddleware
 import psycopg2
 import psycopg2.extras
 import os
+import json
 import uuid
 import jwt
 import bcrypt
@@ -123,6 +124,17 @@ def init_db():
             created_at TEXT
         );
         ALTER TABLE transactions ADD COLUMN IF NOT EXISTS company_id TEXT;
+        ALTER TABLE transactions ADD COLUMN IF NOT EXISTS updated_at TEXT;
+        ALTER TABLE transactions ADD COLUMN IF NOT EXISTS edit_count INTEGER DEFAULT 0;
+        CREATE TABLE IF NOT EXISTS transaction_audit_log (
+            id TEXT PRIMARY KEY,
+            transaction_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            before_json TEXT,
+            after_json TEXT,
+            created_at TEXT
+        );
         """
     )
     conn.commit()
@@ -486,26 +498,68 @@ async def update_transaction(tx_id: str, payload: TransactionIn, user: dict = De
     if not row:
         conn.close()
         raise HTTPException(404, "Transaction not found")
+    before = dict(row)
     date_str = payload.date or row["date"]
     try:
         dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
     except Exception:
         dt = datetime.fromisoformat(row["date"])
     month = dt.strftime("%Y-%m")
+    now = now_utc().isoformat()
     conn.execute(
-        "UPDATE transactions SET kind=%s, amount=%s, account_id=%s, category_id=%s, company_id=%s, note=%s, date=%s, month=%s "
-        "WHERE id=%s AND user_id=%s",
+        "UPDATE transactions SET kind=%s, amount=%s, account_id=%s, category_id=%s, company_id=%s, note=%s, date=%s, month=%s, "
+        "updated_at=%s, edit_count=COALESCE(edit_count,0)+1 WHERE id=%s AND user_id=%s",
         (payload.kind, payload.amount, payload.account_id, payload.category_id, payload.company_id,
-         payload.note or "", dt.isoformat(), month, tx_id, user["user_id"]),
+         payload.note or "", dt.isoformat(), month, now, tx_id, user["user_id"]),
+    )
+    after = {
+        "kind": payload.kind, "amount": payload.amount, "account_id": payload.account_id,
+        "category_id": payload.category_id, "company_id": payload.company_id,
+        "note": payload.note or "", "date": dt.isoformat(), "month": month,
+    }
+    conn.execute(
+        "INSERT INTO transaction_audit_log (id,transaction_id,user_id,action,before_json,after_json,created_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+        (str(uuid.uuid4()), tx_id, user["user_id"], "edit",
+         json.dumps(before, default=str), json.dumps(after, default=str), now),
     )
     conn.commit()
     conn.close()
     return {"transaction": {"id": tx_id, "date": dt.isoformat(), "month": month, **payload.dict()}}
 
 
+@api_router.get("/transactions/{tx_id}/history")
+async def get_transaction_history(tx_id: str, user: dict = Depends(current_user)):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM transaction_audit_log WHERE transaction_id=%s AND user_id=%s ORDER BY created_at DESC",
+        (tx_id, user["user_id"]),
+    ).fetchall()
+    conn.close()
+    return {"history": [dict(r) for r in rows]}
+
+
+@api_router.get("/audit-log")
+async def get_audit_log(user: dict = Depends(current_user), limit: int = 200):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM transaction_audit_log WHERE user_id=%s ORDER BY created_at DESC LIMIT %s",
+        (user["user_id"], limit),
+    ).fetchall()
+    conn.close()
+    return {"log": [dict(r) for r in rows]}
+
+
 @api_router.delete("/transactions/{tx_id}")
 async def delete_transaction(tx_id: str, user: dict = Depends(current_user)):
     conn = get_db()
+    row = conn.execute("SELECT * FROM transactions WHERE id=%s AND user_id=%s", (tx_id, user["user_id"])).fetchone()
+    if row:
+        conn.execute(
+            "INSERT INTO transaction_audit_log (id,transaction_id,user_id,action,before_json,after_json,created_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            (str(uuid.uuid4()), tx_id, user["user_id"], "delete", json.dumps(dict(row), default=str), None, now_utc().isoformat()),
+        )
     conn.execute("DELETE FROM transactions WHERE id=%s AND user_id=%s", (tx_id, user["user_id"]))
     conn.commit()
     conn.close()
