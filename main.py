@@ -195,23 +195,27 @@ def user_public(row: dict) -> dict:
 
 
 DEFAULT_CATEGORIES = [
-    {"name": "Food", "kind": "expense", "color": "#D35400", "icon": "coffee"},
-    {"name": "Travel", "kind": "expense", "color": "#0277BD", "icon": "compass"},
-    {"name": "Bills", "kind": "expense", "color": "#C62828", "icon": "zap"},
-    {"name": "Shopping", "kind": "expense", "color": "#8E24AA", "icon": "shopping-bag"},
-    {"name": "Groceries", "kind": "expense", "color": "#2E7D32", "icon": "shopping-cart"},
-    {"name": "Health", "kind": "expense", "color": "#EF6C00", "icon": "heart"},
-    {"name": "Entertainment", "kind": "expense", "color": "#6A1B9A", "icon": "film"},
-    {"name": "Other", "kind": "expense", "color": "#4F5753", "icon": "more-horizontal"},
-    {"name": "Salary", "kind": "income", "color": "#2E7D32", "icon": "briefcase"},
-    {"name": "Business", "kind": "income", "color": "#1E5128", "icon": "trending-up"},
-    {"name": "Gift", "kind": "income", "color": "#D35400", "icon": "gift"},
+    {"name": "Materials", "kind": "expense", "color": "#C0392B", "icon": "package"},
+    {"name": "Labour", "kind": "expense", "color": "#F0740A", "icon": "users"},
+    {"name": "Equipment Rental", "kind": "expense", "color": "#6B7280", "icon": "tool"},
+    {"name": "Transport", "kind": "expense", "color": "#2563EB", "icon": "truck"},
+    {"name": "Site Expenses", "kind": "expense", "color": "#7C3AED", "icon": "map-pin"},
+    {"name": "Contractor Payment", "kind": "expense", "color": "#B45309", "icon": "briefcase"},
+    {"name": "Permits and Fees", "kind": "expense", "color": "#0F766E", "icon": "file-text"},
+    {"name": "Electrical", "kind": "expense", "color": "#CA8A04", "icon": "zap"},
+    {"name": "Plumbing", "kind": "expense", "color": "#0891B2", "icon": "droplet"},
+    {"name": "Tools", "kind": "expense", "color": "#57534E", "icon": "tool"},
+    {"name": "Fuel", "kind": "expense", "color": "#DC2626", "icon": "truck"},
+    {"name": "Miscellaneous", "kind": "expense", "color": "#6B7280", "icon": "more-horizontal"},
+    {"name": "Client Payment", "kind": "income", "color": "#2E7D32", "icon": "briefcase"},
+    {"name": "Advance Payment", "kind": "income", "color": "#15803D", "icon": "trending-up"},
+    {"name": "Milestone Payment", "kind": "income", "color": "#166534", "icon": "flag"},
     {"name": "Other Income", "kind": "income", "color": "#4F5753", "icon": "plus-circle"},
 ]
 DEFAULT_ACCOUNTS = [
-    {"name": "Cash", "type": "cash", "opening_balance": 0.0, "color": "#1E5128", "icon": "dollar-sign"},
-    {"name": "Bank", "type": "bank", "opening_balance": 0.0, "color": "#0277BD", "icon": "credit-card"},
-    {"name": "UPI", "type": "upi", "opening_balance": 0.0, "color": "#D35400", "icon": "smartphone"},
+    {"name": "Cash", "type": "cash", "opening_balance": 0.0, "color": "#57534E", "icon": "dollar-sign"},
+    {"name": "Bank", "type": "bank", "opening_balance": 0.0, "color": "#2563EB", "icon": "credit-card"},
+    {"name": "UPI", "type": "upi", "opening_balance": 0.0, "color": "#F0740A", "icon": "smartphone"},
 ]
 
 
