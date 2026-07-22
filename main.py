@@ -5,6 +5,8 @@ import psycopg2.extras
 import os
 import json
 import uuid
+import random
+import requests
 import jwt
 import bcrypt
 from pathlib import Path
@@ -19,6 +21,23 @@ DATABASE_URL = os.environ["DATABASE_URL"]  # Supabase Postgres connection string
 JWT_SECRET = os.environ.get("JWT_SECRET", "hisabbook-secret-change-me-in-production")
 JWT_ALG = "HS256"
 JWT_EXP_DAYS = 365  # stay logged in for a year
+
+# Resend.com config for sending password-reset OTP emails (simple API key, no SMTP/2FA needed)
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+RESEND_FROM = os.environ.get("RESEND_FROM", "HisabBook <onboarding@resend.dev>")
+
+
+def send_email(to_email: str, subject: str, body: str):
+    if not RESEND_API_KEY:
+        raise HTTPException(500, "Email is not configured on the server yet")
+    resp = requests.post(
+        "https://api.resend.com/emails",
+        headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+        json={"from": RESEND_FROM, "to": [to_email], "subject": subject, "text": body},
+        timeout=15,
+    )
+    if resp.status_code >= 300:
+        raise HTTPException(500, f"Could not send email: {resp.text}")
 
 app = FastAPI(title="HisabBook API")
 api_router = APIRouter(prefix="/api")
@@ -135,6 +154,15 @@ def init_db():
             after_json TEXT,
             created_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS password_resets (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            email TEXT NOT NULL,
+            otp_code TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            used BOOLEAN DEFAULT FALSE,
+            created_at TEXT
+        );
         """
     )
     conn.commit()
@@ -245,6 +273,16 @@ class LoginIn(BaseModel):
     password: str
 
 
+class ForgotPasswordIn(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordIn(BaseModel):
+    email: EmailStr
+    otp: str
+    new_password: str
+
+
 class AccountIn(BaseModel):
     name: str
     type: Literal["cash", "bank", "upi", "card", "other"] = "cash"
@@ -327,6 +365,65 @@ async def login(payload: LoginIn):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     token = make_jwt(row["user_id"])
     return {"token": token, "user": user_public(dict(row))}
+
+
+@api_router.post("/auth/forgot-password")
+async def forgot_password(payload: ForgotPasswordIn):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM users WHERE email=%s", (payload.email.lower(),)).fetchone()
+    if not row:
+        conn.close()
+        # Don't reveal whether the email exists — respond the same way either way.
+        return {"ok": True, "message": "If this email is registered, an OTP has been sent."}
+    otp = f"{random.randint(0, 999999):06d}"
+    expires_at = (now_utc() + timedelta(minutes=15)).isoformat()
+    conn.execute(
+        "INSERT INTO password_resets (id,user_id,email,otp_code,expires_at,used,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+        (str(uuid.uuid4()), row["user_id"], payload.email.lower(), otp, expires_at, False, now_utc().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    try:
+        send_email(
+            payload.email,
+            "Your HisabBook password reset code",
+            f"Your OTP to reset your HisabBook password is: {otp}\n\nThis code expires in 15 minutes. If you didn't request this, you can ignore this email.",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Could not send email: {e}")
+    return {"ok": True, "message": "If this email is registered, an OTP has been sent."}
+
+
+@api_router.post("/auth/reset-password")
+async def reset_password(payload: ResetPasswordIn):
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM password_resets WHERE email=%s AND otp_code=%s AND used=FALSE ORDER BY created_at DESC LIMIT 1",
+        (payload.email.lower(), payload.otp.strip()),
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(400, "Invalid or already-used OTP")
+    expires_at = row["expires_at"]
+    exp_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00")) if "Z" in expires_at or "+" in expires_at else datetime.fromisoformat(expires_at)
+    if exp_dt.tzinfo is None:
+        exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+    if exp_dt < now_utc():
+        conn.close()
+        raise HTTPException(400, "This OTP has expired. Please request a new one.")
+    if len(payload.new_password) < 6:
+        conn.close()
+        raise HTTPException(400, "Password must be at least 6 characters")
+    conn.execute(
+        "UPDATE users SET password_hash=%s WHERE user_id=%s",
+        (hash_password(payload.new_password), row["user_id"]),
+    )
+    conn.execute("UPDATE password_resets SET used=TRUE WHERE id=%s", (row["id"],))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
 
 
 @api_router.get("/auth/me")
